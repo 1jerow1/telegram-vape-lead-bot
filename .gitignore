@@ -1,0 +1,15 @@
+# приватные данные — никогда не публикуются
+secrets.json
+*.session
+*.session-journal
+
+# рантайм-конфиг с реальными юзернеймами (создаётся автоматически)
+config.json
+joined_groups.json
+
+# python
+__pycache__/
+*.pyc
+
+# scratch/IDE
+tempCodeRunnerFile.py
