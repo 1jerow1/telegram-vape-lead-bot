@@ -542,11 +542,6 @@ async def command_handler(event):
         return
 
     sender = await event.get_sender()
-    print(
-        f"[cmd-debug] ЛС от username={getattr(sender, 'username', None)!r} "
-        f"id={getattr(sender, 'id', None)!r} is_owner={is_owner(sender)} "
-        f"OWNER_ID={OWNER_ID!r}"
-    )
     if not is_owner(sender):
         return
 
