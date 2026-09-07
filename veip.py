@@ -1,26 +1,51 @@
 import json
 import os
+import shutil
 import random
 import asyncio
 import time
 from datetime import datetime, timedelta
 import re
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.errors import FloodWaitError
 
 # ───── НАСТРОЙКИ ─────
+# DATA_DIR — где лежат/создаются все изменяемые файлы (сессия, конфиг,
+# группы, кеш, фидбек). По умолчанию — папка проекта (локальный запуск,
+# ничего не меняется). На Railway/другом хостинге с эфемерным диском можно
+# подключить постоянный Volume и указать DATA_DIR=/путь/к/volume — тогда
+# то, что бот меняет командами в ЛС (группы/банворды/админы/фидбек),
+# переживёт передеплой. Без volume эти файлы каждый передеплой откатятся
+# к тому, что закоммичено в git.
+DATA_DIR = os.environ.get("DATA_DIR", ".")
+
+
+def _data_path(name):
+    return os.path.join(DATA_DIR, name)
+
+
 # api_id/api_hash/owner_id — приватные данные, в репозиторий не попадают.
-# Скопируйте secrets.example.json в secrets.json и впишите свои значения
-# (api_id/api_hash берутся на https://my.telegram.org).
-SECRETS_PATH = "secrets.json"
+# Локально: скопируйте secrets.example.json в secrets.json и впишите свои
+# значения (api_id/api_hash берутся на https://my.telegram.org).
+# На Railway/другом хостинге — задайте переменные окружения API_ID,
+# API_HASH, OWNER_ID вместо файла (см. README, раздел про Railway).
+SECRETS_PATH = _data_path("secrets.json")
 
 
 def load_secrets():
+    env_api_id = os.environ.get("API_ID")
+    env_api_hash = os.environ.get("API_HASH")
+    env_owner_id = os.environ.get("OWNER_ID")
+    if env_api_id and env_api_hash and env_owner_id:
+        return int(env_api_id), env_api_hash, env_owner_id
+
     if not os.path.exists(SECRETS_PATH):
         raise SystemExit(
-            f"Не найден {SECRETS_PATH}. Скопируйте secrets.example.json в "
-            f"{SECRETS_PATH} и укажите свои api_id/api_hash/owner_id."
+            f"Не найден {SECRETS_PATH} и не заданы переменные окружения "
+            "API_ID/API_HASH/OWNER_ID. Локально — скопируйте secrets.example.json "
+            f"в {SECRETS_PATH}; на хостинге — задайте переменные окружения."
         )
     with open(SECRETS_PATH, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -29,7 +54,7 @@ def load_secrets():
 
 api_id, api_hash, OWNER_ID = load_secrets()  # OWNER_ID: кому приходит дневной отчёт, единственный, кто может слать команды управления
 
-CONFIG_PATH = "config.json"
+CONFIG_PATH = _data_path("config.json")
 
 # Значения по умолчанию — используются только пока не создан config.json
 # (первый запуск). Дальше банворды и получателей уведомлений менять
@@ -109,6 +134,30 @@ def rebuild_banned_pattern():
     BANNED_WORDS_PATTERN = _build_word_pattern(BANNED_WORDS)
 
 
+# ───── ОБУЧЕНИЕ С ПОДТВЕРЖДЕНИЕМ (/spam, /notspam, /suggestions) ─────
+FEEDBACK_STOPWORDS = {
+    "в", "на", "и", "с", "по", "за", "для", "от", "до", "из", "у", "о", "а", "но",
+    "же", "ли", "бы", "не", "что", "это", "как", "мне", "вам", "есть", "или",
+    "то", "так", "при", "под", "над",
+} | set(KEYWORDS)
+
+
+def suggest_banned_words(top_n=10, min_count=2):
+    # слово попадает в подсказку, только если встречалось в подтверждённом
+    # спаме минимум min_count раз и ни разу — в подтверждённых лидах
+    spam_counts = {}
+    lead_words = set()
+    for t in FEEDBACK["lead_texts"]:
+        lead_words.update(re.findall(r"[а-яёa-z0-9]+", t))
+    for t in FEEDBACK["spam_texts"]:
+        for w in set(re.findall(r"[а-яёa-z0-9]+", t)):
+            if w in FEEDBACK_STOPWORDS or w in BANNED_WORDS or w in lead_words:
+                continue
+            spam_counts[w] = spam_counts.get(w, 0) + 1
+    ranked = sorted(spam_counts.items(), key=lambda kv: -kv[1])
+    return [(w, c) for w, c in ranked if c >= min_count][:top_n]
+
+
 def normalize_username(username):
     username = username.strip()
     if not username.startswith("@"):
@@ -157,8 +206,17 @@ last_report_date = None
 ENABLE_AUTO_SUBSCRIBE = True
 ENABLE_JOIN_AND_CACHE = True
 # ───── ДАННЫЕ ─────
-GROUPS_PATH = "groups.txt"
-JOINED_GROUPS_PATH = "joined_groups.json"
+GROUPS_PATH = _data_path("groups.txt")
+JOINED_GROUPS_PATH = _data_path("joined_groups.json")
+
+if not os.path.exists(GROUPS_PATH):
+    # DATA_DIR ещё пустой (например, свежий volume на хостинге) — затравка
+    # из groups.txt в корне проекта, который лежит в репозитории
+    bundled_groups = "groups.txt"
+    if DATA_DIR != "." and os.path.exists(bundled_groups):
+        shutil.copy(bundled_groups, GROUPS_PATH)
+    else:
+        open(GROUPS_PATH, "w", encoding="utf-8").close()
 
 with open(GROUPS_PATH, "r", encoding="utf-8") as f:
     GROUPS = [line.strip() for line in f if line.strip()]
@@ -190,6 +248,47 @@ def save_joined_groups():
         json.dump(JOINED_GROUPS, f, ensure_ascii=False, indent=2)
 
 
+FEEDBACK_PATH = _data_path("feedback.json")
+FEEDBACK_CAP = 300  # сколько последних примеров каждого типа хранить
+
+
+def load_feedback():
+    if os.path.exists(FEEDBACK_PATH):
+        try:
+            with open(FEEDBACK_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return {
+                "spam_texts": data.get("spam_texts", []),
+                "lead_texts": data.get("lead_texts", []),
+            }
+        except Exception as e:
+            print(f"[!] Не удалось прочитать {FEEDBACK_PATH}: {e}")
+    return {"spam_texts": [], "lead_texts": []}
+
+
+def save_feedback():
+    with open(FEEDBACK_PATH, "w", encoding="utf-8") as f:
+        json.dump(FEEDBACK, f, ensure_ascii=False, indent=2)
+
+
+# Размеченные примеры сообщений — каждый найденный лид сразу попадает сюда
+# как "notspam" (по умолчанию считаем находку реальным лидом); командой
+# /spam владелец переносит конкретное сообщение в спам. На основе этого
+# /suggestions предлагает новые бан-слова.
+FEEDBACK = load_feedback()
+
+
+def mark_feedback(text, is_spam):
+    target = FEEDBACK["spam_texts"] if is_spam else FEEDBACK["lead_texts"]
+    other = FEEDBACK["lead_texts"] if is_spam else FEEDBACK["spam_texts"]
+    if text in other:
+        other.remove(text)
+    if text not in target:
+        target.append(text)
+    del target[:-FEEDBACK_CAP]  # оставляем только последние FEEDBACK_CAP
+    save_feedback()
+
+
 # Группы, в которые уже успешно вступили — chat_id каждой закеширован тут,
 # так что при обычном рестарте бота ничего не резолвится и не запрашивается
 # через API. Вступление (и резолв через get_entity) повторяется только для
@@ -207,7 +306,20 @@ if _stale_joined:
     save_joined_groups()
 
 
-client = TelegramClient("session", api_id, api_hash)
+# SESSION_STRING (переменная окружения) — сессия Telethon как строка, без
+# файла на диске. Нужна для хостинга с эфемерной файловой системой (Railway
+# и т.п.): без неё контейнер после каждого передеплоя терял бы авторизацию
+# и требовал заново вводить код из Telegram. Строку получить один раз
+# локально скриптом generate_session_string.py и положить в переменные
+# окружения хостинга. Если переменной нет — как раньше, файл session.session
+# в DATA_DIR (локальный запуск).
+SESSION_STRING = os.environ.get("SESSION_STRING")
+if SESSION_STRING:
+    session = StringSession(SESSION_STRING)
+else:
+    session = _data_path("session")
+
+client = TelegramClient(session, api_id, api_hash)
 
 ALLOWED_CHAT_IDS = set()
 # восстанавливаем из кеша без единого запроса к Telegram —
@@ -217,6 +329,12 @@ handled_messages = set()
 user_last_reply = {}
 last_global_send = 0
 user_last_seen = {}
+
+# message_id (в чате с владельцем) → исходный текст лида — чтобы /spam и
+# /notspam, отправленные ответом на пересланное сообщение, знали, какой
+# текст размечать. Переживать перезапуск бота фидбеку не нужно.
+lead_msg_ids = {}
+LEAD_MSG_CAP = 2000
 
 # ───── ВСТУПАЕМ В ГРУППЫ ─────
 async def join_single_group(identifier, skip_if_joined=False):
@@ -345,6 +463,10 @@ async def handler(event):
 
     stats["found"] += 1
 
+    # по умолчанию считаем находку реальным лидом — /spam переносит
+    # конкретное сообщение в спам, если это ошибка
+    mark_feedback(text, is_spam=False)
+
     print("\n🔥 НАЙДЕН КЛИЕНТ")
     print("Группа:", chat.title)
     print("Пользователь:", user_display)
@@ -363,13 +485,19 @@ async def handler(event):
 
     for admin in NOTIFY_USERNAMES:
         try:
-            await client.send_message(admin, admin_text)
+            sent = await client.send_message(admin, admin_text)
+            if admin.lower() == OWNER_ID.lower():
+                # запоминаем, какому сообщению у владельца соответствует
+                # какой текст — для /spam и /notspam
+                lead_msg_ids[sent.id] = event.raw_text
+                if len(lead_msg_ids) > LEAD_MSG_CAP:
+                    lead_msg_ids.clear()
             print(f"✅ Отправлено: {admin}")
         except FloodWaitError as e:
             print(f"⏳ FloodWait для {admin}: {e.seconds} сек")
             await asyncio.sleep(e.seconds)
         except Exception as e:
-            print(f"❌ Не удалось отправить {admin}: {e}")     
+            print(f"❌ Не удалось отправить {admin}: {e}")
 
 
     # try:
@@ -395,6 +523,9 @@ HELP_TEXT = (
     "/addword <слово> — добавить бан-слово\n"
     "/delword <слово> — убрать бан-слово\n"
     "/listwords — показать бан-слова\n"
+    "/spam — ответом на пересланный лид: это спам, а не реальный лид (для /suggestions)\n"
+    "/notspam — ответом на пересланный лид: отменить пометку /spam, если ошиблись\n"
+    "/suggestions — показать слова, частые в спаме и не встречавшиеся в лидах\n"
     "/addgroup <@группа или ссылка> — добавить и вступить в группу\n"
     "/delgroup <@группа> — убрать группу из мониторинга\n"
     "/listgroups — показать список групп\n"
@@ -450,6 +581,29 @@ async def command_handler(event):
 
     elif cmd == "/listwords":
         await event.reply("Бан-слова:\n" + ", ".join(BANNED_WORDS))
+
+    elif cmd in ("/spam", "/notspam"):
+        if not event.is_reply:
+            await event.reply("Ответьте этой командой на пересланное сообщение с лидом")
+            return
+        raw = lead_msg_ids.get(event.reply_to_msg_id)
+        if raw is None:
+            await event.reply("Не нашёл исходный текст для этого сообщения (слишком старое или не от бота)")
+            return
+        mark_feedback(raw.lower(), is_spam=(cmd == "/spam"))
+        await event.reply("✅ Записано как " + ("спам" if cmd == "/spam" else "реальный лид"))
+
+    elif cmd == "/suggestions":
+        candidates = suggest_banned_words()
+        if not candidates:
+            await event.reply("Пока нет кандидатов — нужно больше размеченного спама через /spam")
+            return
+        lines = [f"{w} (в спаме {c} раз)" for w, c in candidates]
+        await event.reply(
+            "Возможные новые бан-слова (встречались только в спаме, ни разу в лидах):\n"
+            + "\n".join(lines)
+            + "\n\nДобавить: /addword <слово>"
+        )
 
     elif cmd == "/addgroup":
         if not arg:

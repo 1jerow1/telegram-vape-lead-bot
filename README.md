@@ -17,7 +17,7 @@ pip install -r requirements.txt
 ## Настройка
 
 1. Получите `api_id` и `api_hash` на <https://my.telegram.org>.
-2. Скопируйте `secrets.example.json` в `secrets.json` и впишите свои `api_id`, `api_hash` и `owner_id` (ваш Telegram-username — единственный, кто может слать боту команды управления).
+2. Скопируйте `secrets.example.json` в `secrets.json` и впишите свои `api_id`, `api_hash` и `owner_id` (ваш Telegram-username — единственный, кто может слать боту команды управления). Вместо файла можно задать переменные окружения `API_ID`/`API_HASH`/`OWNER_ID` — так это делается при деплое на Railway (см. ниже).
 3. Заполните `groups.txt` — по одной ссылке/юзернейму группы на строку.
 4. Запустите:
 
@@ -34,7 +34,22 @@ pip install -r requirements.txt
 - `veip.py` — основной юзербот.
 - `get_ids.py` — вспомогательный скрипт для проверки последних сообщений в «Избранном» той же сессии.
 - `veip_autostart.bat` — автозапуск на Windows.
+- `generate_session_string.py` — разовый скрипт для деплоя на хостинг (см. ниже).
+
+## Деплой на Railway
+
+У Railway (и подобных хостингов) эфемерная файловая система — контейнер каждый передеплой пересоздаётся с нуля. Поэтому вместо файлов `secrets.json`/`session.session` используются переменные окружения:
+
+1. Запушьте репозиторий в GitHub, в Railway — New Project → Deploy from GitHub repo.
+2. Локально один раз выполните `python generate_session_string.py` (нужен `secrets.json`, как для обычного запуска) — на выходе строка сессии.
+3. В настройках сервиса на Railway (Variables) задайте:
+   - `API_ID`, `API_HASH` — с <https://my.telegram.org>;
+   - `OWNER_ID` — ваш Telegram-username;
+   - `SESSION_STRING` — строка из шага 2.
+4. `railway.toml` уже задаёт команду запуска (`python veip.py`) и автоперезапуск при падении — ничего дополнительно настраивать не нужно. Порт открывать не требуется — это фоновый воркер, а не веб-сервис.
+
+**Про `groups.txt`/`config.json`/`joined_groups.json`/`feedback.json`.** Это файлы, которые бот сам меняет командами в ЛС (`/addgroup`, `/addword`, `/addadmin`, `/spam`). Без Volume они лежат в самом контейнере и при следующем передеплое откатятся к состоянию из git (`groups.txt`) или создадутся заново пустыми (остальные) — авторизация и подписки на группы при этом не теряются (см. `SESSION_STRING` и кеш `joined_groups.json`, который просто пересоздастся). Если хочется, чтобы изменения командами переживали передеплой — подключите в Railway постоянный Volume, смонтируйте его (например, в `/data`) и задайте переменную окружения `DATA_DIR=/data`: все эти файлы будут читаться/писаться туда.
 
 ## Безопасность
 
-`secrets.json` и `session.session` дают полный доступ к Telegram-аккаунту — никогда не публикуйте и не коммитьте их (они уже в `.gitignore`).
+`secrets.json`, `session.session` и `SESSION_STRING` дают полный доступ к Telegram-аккаунту — никогда не публикуйте и не коммитьте их (файлы уже в `.gitignore`; переменные окружения храните только в настройках хостинга).

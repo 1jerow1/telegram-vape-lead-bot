@@ -7,6 +7,9 @@ secrets.json
 config.json
 joined_groups.json
 
+# размеченные сообщения пользователей для /suggestions — приватные данные
+feedback.json
+
 # python
 __pycache__/
 *.pyc
