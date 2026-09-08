@@ -142,20 +142,48 @@ FEEDBACK_STOPWORDS = {
 } | set(KEYWORDS)
 
 
+def _lead_words():
+    words = set()
+    for t in FEEDBACK["lead_texts"]:
+        words.update(re.findall(r"[а-яёa-z0-9]+", t))
+    return words
+
+
+def _candidate_words(text, lead_words):
+    # слова этого текста, которые ещё не забанены, не встречались в
+    # подтверждённых лидах и не являются служебными — потенциальные банворды
+    words = []
+    for w in set(re.findall(r"[а-яёa-z0-9]+", text)):
+        if len(w) < 3 or w.isdigit():
+            continue
+        if w in FEEDBACK_STOPWORDS or w in BANNED_WORDS or w in lead_words:
+            continue
+        words.append(w)
+    return words
+
+
 def suggest_banned_words(top_n=10, min_count=2):
     # слово попадает в подсказку, только если встречалось в подтверждённом
     # спаме минимум min_count раз и ни разу — в подтверждённых лидах
+    lead_words = _lead_words()
     spam_counts = {}
-    lead_words = set()
-    for t in FEEDBACK["lead_texts"]:
-        lead_words.update(re.findall(r"[а-яёa-z0-9]+", t))
     for t in FEEDBACK["spam_texts"]:
-        for w in set(re.findall(r"[а-яёa-z0-9]+", t)):
-            if w in FEEDBACK_STOPWORDS or w in BANNED_WORDS or w in lead_words:
-                continue
+        for w in _candidate_words(t, lead_words):
             spam_counts[w] = spam_counts.get(w, 0) + 1
     ranked = sorted(spam_counts.items(), key=lambda kv: -kv[1])
     return [(w, c) for w, c in ranked if c >= min_count][:top_n]
+
+
+def auto_ban_from_spam(text):
+    # /spam — сразу баним отличительные слова из ЭТОГО сообщения (в отличие
+    # от suggest_banned_words не ждём повторов) — чтобы такое же или похожее
+    # сообщение не прошло уже следующим разом, без отдельного /addword
+    added = _candidate_words(text, _lead_words())
+    if added:
+        BANNED_WORDS.extend(added)
+        rebuild_banned_pattern()
+        save_config()
+    return added
 
 
 def normalize_username(username):
@@ -523,9 +551,9 @@ HELP_TEXT = (
     "/addword <слово> — добавить бан-слово\n"
     "/delword <слово> — убрать бан-слово\n"
     "/listwords — показать бан-слова\n"
-    "/spam — ответом на пересланный лид: это спам, а не реальный лид (для /suggestions)\n"
+    "/spam — ответом на пересланный лид: это спам, сразу банит его характерные слова\n"
     "/notspam — ответом на пересланный лид: отменить пометку /spam, если ошиблись\n"
-    "/suggestions — показать слова, частые в спаме и не встречавшиеся в лидах\n"
+    "/suggestions — слова, частые в отмеченном спаме, но не забаненные автоматически\n"
     "/addgroup <@группа или ссылка> — добавить и вступить в группу\n"
     "/delgroup <@группа> — убрать группу из мониторинга\n"
     "/listgroups — показать список групп\n"
@@ -590,8 +618,22 @@ async def command_handler(event):
         if raw is None:
             await event.reply("Не нашёл исходный текст для этого сообщения (слишком старое или не от бота)")
             return
-        mark_feedback(raw.lower(), is_spam=(cmd == "/spam"))
-        await event.reply("✅ Записано как " + ("спам" if cmd == "/spam" else "реальный лид"))
+        text_lower = raw.lower()
+        mark_feedback(text_lower, is_spam=(cmd == "/spam"))
+        if cmd == "/spam":
+            added = auto_ban_from_spam(text_lower)
+            if added:
+                await event.reply(
+                    "✅ Помечено как спам, сразу забанены слова: " + ", ".join(added)
+                    + "\nЕсли что-то забанено зря — уберите: /delword <слово>"
+                )
+            else:
+                await event.reply(
+                    "✅ Помечено как спам (новых слов для бана не нашлось — "
+                    "видимо, все уже забанены или встречались в реальных лидах)"
+                )
+        else:
+            await event.reply("✅ Записано как реальный лид")
 
     elif cmd == "/suggestions":
         candidates = suggest_banned_words()

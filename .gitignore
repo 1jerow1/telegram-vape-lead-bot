@@ -2,6 +2,7 @@
 secrets.json
 *.session
 *.session-journal
+session_string.txt
 
 # рантайм-конфиг с реальными юзернеймами (создаётся автоматически)
 config.json
