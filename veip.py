@@ -4,6 +4,7 @@ import shutil
 import random
 import asyncio
 import time
+import math
 from datetime import datetime, timedelta
 import re
 from telethon import TelegramClient, events
@@ -186,6 +187,58 @@ def auto_ban_from_spam(text):
     return added
 
 
+# ───── КЛАССИФИКАТОР (наивный байес поверх feedback.json) ─────
+# Дополнительный слой поверх банвордов: ищет закономерности по всему
+# накопленному тексту, а не только по отдельным словам из /spam. Пока
+# примеров мало — молчит (см. CLASSIFIER_MIN_EXAMPLES), чтобы не резать
+# лиды на шумных данных. Ничего не банит "навсегда" — просто решает,
+# пересылать ли конкретное сообщение, работает при каждой проверке заново.
+ENABLE_ML_CLASSIFIER = True
+CLASSIFIER_MIN_EXAMPLES = 15   # меньше — данных мало, классификатор не включаем
+CLASSIFIER_MARGIN = 3.0        # насколько увереннее "спам", чтобы заблокировать
+
+
+def _word_counts(texts):
+    counts = {}
+    total = 0
+    for t in texts:
+        for w in re.findall(r"[а-яёa-z0-9]+", t):
+            counts[w] = counts.get(w, 0) + 1
+            total += 1
+    return counts, total
+
+
+def classify_spam(text):
+    """
+    Наивный байесовский классификатор на словах из FEEDBACK["spam_texts"]/
+    ["lead_texts"]. Возвращает (is_spam, margin). is_spam=True — только
+    если данных достаточно и модель уверена (margin > CLASSIFIER_MARGIN).
+    margin — насколько лог-правдоподобие "спам" больше, чем "лид"
+    (для логов/отладки).
+    """
+    spam_texts = FEEDBACK["spam_texts"]
+    lead_texts = FEEDBACK["lead_texts"]
+    if len(spam_texts) < CLASSIFIER_MIN_EXAMPLES or len(lead_texts) < CLASSIFIER_MIN_EXAMPLES:
+        return False, 0.0
+
+    spam_counts, spam_total = _word_counts(spam_texts)
+    lead_counts, lead_total = _word_counts(lead_texts)
+    vocab_size = len(set(spam_counts) | set(lead_counts)) or 1
+
+    n_spam, n_lead = len(spam_texts), len(lead_texts)
+    log_spam = math.log(n_spam / (n_spam + n_lead))
+    log_lead = math.log(n_lead / (n_spam + n_lead))
+
+    for w in re.findall(r"[а-яёa-z0-9]+", text):
+        # сглаживание Лапласа — чтобы слово, которого модель не видела,
+        # не обнуляло вероятность целиком
+        log_spam += math.log((spam_counts.get(w, 0) + 1) / (spam_total + vocab_size))
+        log_lead += math.log((lead_counts.get(w, 0) + 1) / (lead_total + vocab_size))
+
+    margin = log_spam - log_lead
+    return margin > CLASSIFIER_MARGIN, margin
+
+
 def normalize_username(username):
     username = username.strip()
     if not username.startswith("@"):
@@ -226,6 +279,7 @@ stats = {
     "sent": 0,
     "filtered_long": 0,
     "filtered_duplicate": 0,
+    "filtered_classifier": 0,
 }
 
 found_clients = []
@@ -459,6 +513,13 @@ async def handler(event):
         print("🚫 Сообщение содержит запрещённые слова, пропускаем")
         return
 
+    if ENABLE_ML_CLASSIFIER:
+        is_spam_ml, margin = classify_spam(text)
+        if is_spam_ml:
+            stats["filtered_classifier"] += 1
+            print(f"🚫 Классификатор считает спамом (увер. {margin:.1f}), пропускаем")
+            return
+
     now = time.time()
 
     # антидубль: один пользователь в разных группах (по ID)
@@ -554,6 +615,7 @@ HELP_TEXT = (
     "/spam — ответом на пересланный лид: это спам, сразу банит его характерные слова\n"
     "/notspam — ответом на пересланный лид: отменить пометку /spam, если ошиблись\n"
     "/suggestions — слова, частые в отмеченном спаме, но не забаненные автоматически\n"
+    "/mlstatus — состояние классификатора (сколько примеров, активен ли)\n"
     "/addgroup <@группа или ссылка> — добавить и вступить в группу\n"
     "/delgroup <@группа> — убрать группу из мониторинга\n"
     "/listgroups — показать список групп\n"
@@ -647,6 +709,17 @@ async def command_handler(event):
             + "\n\nДобавить: /addword <слово>"
         )
 
+    elif cmd == "/mlstatus":
+        n_spam = len(FEEDBACK["spam_texts"])
+        n_lead = len(FEEDBACK["lead_texts"])
+        active = ENABLE_ML_CLASSIFIER and n_spam >= CLASSIFIER_MIN_EXAMPLES and n_lead >= CLASSIFIER_MIN_EXAMPLES
+        await event.reply(
+            f"Классификатор: {'включён' if active else 'выключен (мало данных)'}\n"
+            f"Примеров спама: {n_spam}/{CLASSIFIER_MIN_EXAMPLES}\n"
+            f"Примеров лидов: {n_lead}/{CLASSIFIER_MIN_EXAMPLES}\n"
+            f"Порог уверенности: {CLASSIFIER_MARGIN}"
+        )
+
     elif cmd == "/addgroup":
         if not arg:
             await event.reply("Использование: /addgroup <@группа или ссылка>")
@@ -733,6 +806,7 @@ async def send_daily_report():
 
 🚫 Длинные: {stats['filtered_long']}
 🚫 Дубликаты: {stats['filtered_duplicate']}
+🚫 Классификатор: {stats['filtered_classifier']}
 """
 
     if found_clients:
