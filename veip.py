@@ -89,29 +89,47 @@ DEFAULT_BANNED_WORDS = [
 ]
 
 
+# Переключатели фильтров (меняются командами /banwords и /mlfilter в ЛС).
+# Фильтр ВКЛЮЧЁН  — сообщение, похожее на спам, уходит ТОЛЬКО владельцу на
+#                   проверку и не рассылается остальным получателям.
+# Фильтр ВЫКЛЮЧЕН — соответствующая проверка вообще не выполняется, такое
+#                   сообщение идёт как обычный лид.
+DEFAULT_SETTINGS = {
+    "banwords_filter": True,   # реагировать на бан-слова
+    "ml_filter": True,         # реагировать на классификатор
+}
+
+
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            settings = dict(DEFAULT_SETTINGS)
+            settings.update(data.get("settings", {}))
             return (
                 data.get("notify_usernames", DEFAULT_NOTIFY_USERNAMES),
                 data.get("banned_words", DEFAULT_BANNED_WORDS),
+                settings,
             )
         except Exception as e:
             print(f"[!] Не удалось прочитать {CONFIG_PATH}: {e}")
-    return list(DEFAULT_NOTIFY_USERNAMES), list(DEFAULT_BANNED_WORDS)
+    return list(DEFAULT_NOTIFY_USERNAMES), list(DEFAULT_BANNED_WORDS), dict(DEFAULT_SETTINGS)
 
 
 def save_config():
     with open(CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(
-            {"notify_usernames": NOTIFY_USERNAMES, "banned_words": BANNED_WORDS},
+            {
+                "notify_usernames": NOTIFY_USERNAMES,
+                "banned_words": BANNED_WORDS,
+                "settings": SETTINGS,
+            },
             f, ensure_ascii=False, indent=2,
         )
 
 
-NOTIFY_USERNAMES, BANNED_WORDS = load_config()
+NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS = load_config()
 
 KEYWORDS = [
     "куплю", "купить", "покупаю", "ищу", "срочно куплю",
@@ -280,6 +298,7 @@ stats = {
     "filtered_long": 0,
     "filtered_duplicate": 0,
     "filtered_classifier": 0,
+    "spam_to_owner": 0,   # похоже на спам — отправлено владельцу на проверку
 }
 
 found_clients = []
@@ -418,6 +437,17 @@ user_last_seen = {}
 lead_msg_ids = {}
 LEAD_MSG_CAP = 2000
 
+# message_id (в чате с владельцем) → данные сообщения, которое бот счёл
+# похожим на спам (бан-слово / классификатор) и отправил ТОЛЬКО владельцу,
+# не рассылая остальным. Ответом на это сообщение работают:
+#   /notspam — это реальный лид, разослать остальным получателям;
+#   /spam    — подтвердить, что спам.
+suspected_spam_msgs = {}
+SUSPECTED_SPAM_CAP = 500
+# антифлуд: одно «похоже на спам» от пользователя не чаще раза в час
+suspected_spam_last_seen = {}
+SUSPECTED_SPAM_WINDOW = 60 * 60
+
 # ───── ВСТУПАЕМ В ГРУППЫ ─────
 async def join_single_group(identifier, skip_if_joined=False):
     entity = await client.get_entity(identifier)
@@ -469,6 +499,56 @@ async def join_groups_and_cache_ids():
                 print(f"⏳ Ждём {wait_time} сек (из Exception)...")
                 await asyncio.sleep(wait_time)
 
+# ───── ПОХОЖЕ НА СПАМ → ТОЛЬКО ВЛАДЕЛЬЦУ ─────
+async def route_suspected_spam(event, chat, sender, reason):
+    # Сообщение похоже на спам (бан-слово или классификатор): остальным
+    # получателям НЕ рассылаем, показываем только владельцу. Он ответит
+    # /notspam, если это всё-таки лид (тогда разошлём остальным), или
+    # /spam, чтобы подтвердить спам.
+    now = time.time()
+    if now - suspected_spam_last_seen.get(sender.id, 0) < SUSPECTED_SPAM_WINDOW:
+        return
+    suspected_spam_last_seen[sender.id] = now
+
+    if chat.username:
+        message_link = f"https://t.me/{chat.username}/{event.id}"
+    else:
+        chat_id_positive = abs(chat.id) if chat.id < 0 else chat.id
+        message_link = f"https://t.me/c/{chat_id_positive}/{event.id}"
+
+    if sender.username:
+        user_display = f"@{sender.username}"
+    else:
+        user_display = f"Пользователь {sender.id} (без username)"
+
+    # текущая ставка бота — спам; /notspam переносит обратно в лиды
+    mark_feedback((event.raw_text or "").lower(), is_spam=True)
+
+    owner_text = (
+        f"⚠️ ПОХОЖЕ НА СПАМ ({reason})\n"
+        f"{user_display}\n"
+        f"{event.raw_text}\n"
+        f"{message_link}\n\n"
+        f"Ответьте /notspam — это реальный лид (разошлю остальным)\n"
+        f"или /spam — подтвердить спам"
+    )
+    try:
+        sent = await client.send_message(OWNER_ID, owner_text)
+        suspected_spam_msgs[sent.id] = {
+            "raw": event.raw_text or "",
+            "link": message_link,
+            "user_display": user_display,
+        }
+        if len(suspected_spam_msgs) > SUSPECTED_SPAM_CAP:
+            suspected_spam_msgs.clear()
+        print(f"⚠️ Похоже на спам — отправлено владельцу ({reason})")
+    except FloodWaitError as e:
+        print(f"⏳ FloodWait при отправке владельцу: {e.seconds} сек")
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        print(f"❌ Не удалось отправить владельцу: {e}")
+
+
 # ───── ОБРАБОТКА СООБЩЕНИЙ ─────
 @client.on(events.NewMessage)
 async def handler(event):
@@ -509,16 +589,28 @@ async def handler(event):
     if not KEYWORDS_PATTERN.search(text):
         return
 
-    if BANNED_WORDS_PATTERN.search(text):
-        print("🚫 Сообщение содержит запрещённые слова, пропускаем")
-        return
+    # Похоже ли на спам. Каждый фильтр можно выключить командой в ЛС
+    # (/banwords off, /mlfilter off) — тогда его проверка пропускается,
+    # и сообщение идёт как обычный лид.
+    spam_reason = None
 
-    if ENABLE_ML_CLASSIFIER:
+    if SETTINGS["banwords_filter"]:
+        m = BANNED_WORDS_PATTERN.search(text)
+        if m:
+            spam_reason = f"бан-слово: «{m.group(0)}»"
+
+    if spam_reason is None and ENABLE_ML_CLASSIFIER and SETTINGS["ml_filter"]:
         is_spam_ml, margin = classify_spam(text)
         if is_spam_ml:
             stats["filtered_classifier"] += 1
-            print(f"🚫 Классификатор считает спамом (увер. {margin:.1f}), пропускаем")
-            return
+            spam_reason = f"классификатор, уверенность {margin:.1f}"
+
+    if spam_reason is not None:
+        # не роняем молча — отправляем владельцу на проверку, остальным нет
+        stats["spam_to_owner"] += 1
+        print(f"🚫 Похоже на спам ({spam_reason}) — только владельцу на проверку")
+        await route_suspected_spam(event, chat, sender, spam_reason)
+        return
 
     now = time.time()
 
@@ -612,10 +704,12 @@ HELP_TEXT = (
     "/addword <слово> — добавить бан-слово\n"
     "/delword <слово> — убрать бан-слово\n"
     "/listwords — показать бан-слова\n"
-    "/spam — ответом на пересланный лид: это спам, сразу банит его характерные слова\n"
-    "/notspam — ответом на пересланный лид: отменить пометку /spam, если ошиблись\n"
+    "/spam — ответом на лид или «похоже на спам»: это спам, банит характерные слова\n"
+    "/notspam — ответом на «похоже на спам»: это реальный лид, разошлю остальным (или отмена /spam)\n"
     "/suggestions — слова, частые в отмеченном спаме, но не забаненные автоматически\n"
     "/mlstatus — состояние классификатора (сколько примеров, активен ли)\n"
+    "/banwords [on|off] — фильтр по бан-словам: похожее на спам идёт только вам (по умолч. on)\n"
+    "/mlfilter [on|off] — то же для классификатора\n"
     "/addgroup <@группа или ссылка> — добавить и вступить в группу\n"
     "/delgroup <@группа> — убрать группу из мониторинга\n"
     "/listgroups — показать список групп\n"
@@ -676,6 +770,41 @@ async def command_handler(event):
         if not event.is_reply:
             await event.reply("Ответьте этой командой на пересланное сообщение с лидом")
             return
+
+        # 1) ответ на сообщение «похоже на спам» (ушло только владельцу)
+        info = suspected_spam_msgs.get(event.reply_to_msg_id)
+        if info is not None:
+            text_lower = info["raw"].lower()
+            if cmd == "/notspam":
+                suspected_spam_msgs.pop(event.reply_to_msg_id, None)
+                mark_feedback(text_lower, is_spam=False)
+                admin_text = f"{info['user_display']}\n{info['raw']}\n{info['link']}"
+                delivered = []
+                for admin in NOTIFY_USERNAMES:
+                    if admin.lower() == OWNER_ID.lower():
+                        continue
+                    try:
+                        await client.send_message(admin, admin_text)
+                        delivered.append(admin)
+                    except FloodWaitError as e:
+                        print(f"⏳ FloodWait для {admin}: {e.seconds} сек")
+                        await asyncio.sleep(e.seconds)
+                    except Exception as e:
+                        print(f"❌ Не удалось отправить {admin}: {e}")
+                if delivered:
+                    await event.reply("✅ Реальный лид, разослано: " + ", ".join(delivered))
+                else:
+                    await event.reply("✅ Реальный лид (других получателей нет)")
+            else:  # /spam — подтвердить
+                mark_feedback(text_lower, is_spam=True)
+                added = auto_ban_from_spam(text_lower)
+                if added:
+                    await event.reply("✅ Спам подтверждён, забанены слова: " + ", ".join(added))
+                else:
+                    await event.reply("✅ Спам подтверждён")
+            return
+
+        # 2) ответ на обычный пересланный лид
         raw = lead_msg_ids.get(event.reply_to_msg_id)
         if raw is None:
             await event.reply("Не нашёл исходный текст для этого сообщения (слишком старое или не от бота)")
@@ -712,13 +841,35 @@ async def command_handler(event):
     elif cmd == "/mlstatus":
         n_spam = len(FEEDBACK["spam_texts"])
         n_lead = len(FEEDBACK["lead_texts"])
-        active = ENABLE_ML_CLASSIFIER and n_spam >= CLASSIFIER_MIN_EXAMPLES and n_lead >= CLASSIFIER_MIN_EXAMPLES
+        enough = n_spam >= CLASSIFIER_MIN_EXAMPLES and n_lead >= CLASSIFIER_MIN_EXAMPLES
+        if not SETTINGS["ml_filter"]:
+            state = "выключен командой /mlfilter off"
+        elif ENABLE_ML_CLASSIFIER and enough:
+            state = "включён"
+        else:
+            state = "выключен (мало данных)"
         await event.reply(
-            f"Классификатор: {'включён' if active else 'выключен (мало данных)'}\n"
+            f"Классификатор: {state}\n"
             f"Примеров спама: {n_spam}/{CLASSIFIER_MIN_EXAMPLES}\n"
             f"Примеров лидов: {n_lead}/{CLASSIFIER_MIN_EXAMPLES}\n"
             f"Порог уверенности: {CLASSIFIER_MARGIN}"
         )
+
+    elif cmd in ("/banwords", "/mlfilter"):
+        key = "banwords_filter" if cmd == "/banwords" else "ml_filter"
+        label = "Фильтр по бан-словам" if cmd == "/banwords" else "Классификатор"
+        a = arg.lower()
+        if a in ("on", "вкл", "1", "true"):
+            SETTINGS[key] = True
+            save_config()
+            await event.reply(f"✅ {label}: включён — похожее на спам идёт только вам на проверку")
+        elif a in ("off", "выкл", "0", "false"):
+            SETTINGS[key] = False
+            save_config()
+            await event.reply(f"✅ {label}: выключен — эта проверка больше не выполняется")
+        else:
+            st = "включён" if SETTINGS[key] else "выключен"
+            await event.reply(f"{label}: {st}\nПереключить: {cmd} on | {cmd} off")
 
     elif cmd == "/addgroup":
         if not arg:
@@ -807,6 +958,7 @@ async def send_daily_report():
 🚫 Длинные: {stats['filtered_long']}
 🚫 Дубликаты: {stats['filtered_duplicate']}
 🚫 Классификатор: {stats['filtered_classifier']}
+⚠️ Похоже на спам (вам на проверку): {stats['spam_to_owner']}
 """
 
     if found_clients:
