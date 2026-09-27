@@ -27,7 +27,6 @@ def _data_path(name):
     return os.path.join(DATA_DIR, name)
 
 
-# api_id/api_hash/owner_id — приватные данные, в репозиторий не попадают.
 # Локально: скопируйте secrets.example.json в secrets.json и впишите свои
 # значения (api_id/api_hash берутся на https://my.telegram.org).
 # На Railway/другом хостинге — задайте переменные окружения API_ID,
