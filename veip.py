@@ -114,6 +114,11 @@ DEFAULT_OPT_WORDS = [
     "поставщик", "поставщика", "поставщику", "поставщиков", "поставщиком",
 ]
 
+# Если в сообщении есть одно из этих слов — в опт не шлём, даже если
+# сработало опт-слово выше. "продам" = человек продаёт, а не ищет
+# поставщика/опт — это не тот лид, что нужен @BigPar_Opt.
+DEFAULT_OPT_EXCLUDE_WORDS = ["продам"]
+
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -128,12 +133,13 @@ def load_config():
                 settings,
                 data.get("opt_notify_usernames", DEFAULT_OPT_NOTIFY_USERNAMES),
                 data.get("opt_words", DEFAULT_OPT_WORDS),
+                data.get("opt_exclude_words", DEFAULT_OPT_EXCLUDE_WORDS),
             )
         except Exception as e:
             print(f"[!] Не удалось прочитать {CONFIG_PATH}: {e}")
     return (
         list(DEFAULT_NOTIFY_USERNAMES), list(DEFAULT_BANNED_WORDS), dict(DEFAULT_SETTINGS),
-        list(DEFAULT_OPT_NOTIFY_USERNAMES), list(DEFAULT_OPT_WORDS),
+        list(DEFAULT_OPT_NOTIFY_USERNAMES), list(DEFAULT_OPT_WORDS), list(DEFAULT_OPT_EXCLUDE_WORDS),
     )
 
 
@@ -146,12 +152,13 @@ def save_config():
                 "settings": SETTINGS,
                 "opt_notify_usernames": OPT_NOTIFY_USERNAMES,
                 "opt_words": OPT_WORDS,
+                "opt_exclude_words": OPT_EXCLUDE_WORDS,
             },
             f, ensure_ascii=False, indent=2,
         )
 
 
-NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS, OPT_NOTIFY_USERNAMES, OPT_WORDS = load_config()
+NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS, OPT_NOTIFY_USERNAMES, OPT_WORDS, OPT_EXCLUDE_WORDS = load_config()
 
 KEYWORDS = [
     "куплю", "купить", "покупаю", "ищу", "срочно куплю",
@@ -169,6 +176,7 @@ def _build_word_pattern(words):
 KEYWORDS_PATTERN = _build_word_pattern(KEYWORDS)
 BANNED_WORDS_PATTERN = _build_word_pattern(BANNED_WORDS)
 OPT_WORDS_PATTERN = _build_word_pattern(OPT_WORDS)
+OPT_EXCLUDE_PATTERN = _build_word_pattern(OPT_EXCLUDE_WORDS)
 
 
 def rebuild_banned_pattern():
@@ -179,6 +187,11 @@ def rebuild_banned_pattern():
 def rebuild_opt_pattern():
     global OPT_WORDS_PATTERN
     OPT_WORDS_PATTERN = _build_word_pattern(OPT_WORDS)
+
+
+def rebuild_opt_exclude_pattern():
+    global OPT_EXCLUDE_PATTERN
+    OPT_EXCLUDE_PATTERN = _build_word_pattern(OPT_EXCLUDE_WORDS)
 
 
 # ───── ОБУЧЕНИЕ С ПОДТВЕРЖДЕНИЕМ (/spam, /notspam, /suggestions) ─────
@@ -664,7 +677,8 @@ async def handler(event):
     # Опт — отдельный поток, проверяется независимо от розничных KEYWORDS
     # (сообщение может не содержать "куплю"/"ищу" вовсе, например "нужен
     # поставщик, объёмы большие") и не фильтруется банвордами/классификатором.
-    if OPT_WORDS_PATTERN.search(text):
+    # OPT_EXCLUDE_PATTERN ("продам" и т.п.) — если есть, это не лид для опта.
+    if OPT_WORDS_PATTERN.search(text) and not OPT_EXCLUDE_PATTERN.search(text):
         await route_opt_lead(event, chat, sender)
 
     if not KEYWORDS_PATTERN.search(text):
@@ -803,6 +817,9 @@ HELP_TEXT = (
     "/addoptadmin <@username> — добавить получателя опт-лидов (по умолч. @BigPar_Opt)\n"
     "/deloptadmin <@username> — убрать получателя опт-лидов\n"
     "/listoptadmins — показать получателей опт-лидов\n"
+    "/addoptexclude <слово> — если слово есть в сообщении, в опт НЕ слать (по умолч. «продам»)\n"
+    "/deloptexclude <слово> — убрать слово-исключение из опта\n"
+    "/listoptexcludes — показать слова-исключения опта\n"
     "/help — это сообщение"
 )
 
@@ -1076,6 +1093,32 @@ async def command_handler(event):
 
     elif cmd == "/listoptadmins":
         await event.reply("Получатели опт-лидов:\n" + "\n".join(OPT_NOTIFY_USERNAMES))
+
+    elif cmd == "/addoptexclude":
+        if not arg:
+            await event.reply("Использование: /addoptexclude <слово или фраза>")
+            return
+        word = arg.lower()
+        if word in OPT_EXCLUDE_WORDS:
+            await event.reply(f"«{word}» уже в исключениях опта")
+            return
+        OPT_EXCLUDE_WORDS.append(word)
+        rebuild_opt_exclude_pattern()
+        save_config()
+        await event.reply(f"✅ Добавлено слово-исключение опта: {word}")
+
+    elif cmd == "/deloptexclude":
+        word = arg.lower()
+        if word not in OPT_EXCLUDE_WORDS:
+            await event.reply(f"«{word}» не найдено в исключениях опта")
+            return
+        OPT_EXCLUDE_WORDS.remove(word)
+        rebuild_opt_exclude_pattern()
+        save_config()
+        await event.reply(f"✅ Убрано слово-исключение опта: {word}")
+
+    elif cmd == "/listoptexcludes":
+        await event.reply("Слова-исключения опта:\n" + ", ".join(OPT_EXCLUDE_WORDS))
 
 # ───── ДНЕВНОЙ ОТЧЁТ ─────
 async def send_daily_report():
