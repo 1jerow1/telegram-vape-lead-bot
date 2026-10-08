@@ -100,6 +100,20 @@ DEFAULT_SETTINGS = {
     "ml_filter": True,         # реагировать на классификатор
 }
 
+# ───── ОПТ-ПОТОК (отдельно от розничных лидов) ─────
+# По запросу @BigPar_Opt: сообщения про опт/поставщиков — отдельная ниша,
+# не связана с розничными KEYWORDS/BANNED_WORDS/классификатором. Числа вида
+# "50шт"/"200 шт" НЕ берутся как триггер — слишком шумно (совпадёт с кучей
+# обычных розничных сообщений), поэтому только смысловые слова.
+DEFAULT_OPT_NOTIFY_USERNAMES = ["@BigPar_Opt"]
+
+DEFAULT_OPT_WORDS = [
+    "опт", "оптом", "опту", "оптовый", "оптовая", "оптовое", "оптовые",
+    "оптовых", "оптовому", "оптовой",
+    "большой объем", "большой объём",
+    "поставщик", "поставщика", "поставщику", "поставщиков", "поставщиком",
+]
+
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
@@ -112,10 +126,15 @@ def load_config():
                 data.get("notify_usernames", DEFAULT_NOTIFY_USERNAMES),
                 data.get("banned_words", DEFAULT_BANNED_WORDS),
                 settings,
+                data.get("opt_notify_usernames", DEFAULT_OPT_NOTIFY_USERNAMES),
+                data.get("opt_words", DEFAULT_OPT_WORDS),
             )
         except Exception as e:
             print(f"[!] Не удалось прочитать {CONFIG_PATH}: {e}")
-    return list(DEFAULT_NOTIFY_USERNAMES), list(DEFAULT_BANNED_WORDS), dict(DEFAULT_SETTINGS)
+    return (
+        list(DEFAULT_NOTIFY_USERNAMES), list(DEFAULT_BANNED_WORDS), dict(DEFAULT_SETTINGS),
+        list(DEFAULT_OPT_NOTIFY_USERNAMES), list(DEFAULT_OPT_WORDS),
+    )
 
 
 def save_config():
@@ -125,12 +144,14 @@ def save_config():
                 "notify_usernames": NOTIFY_USERNAMES,
                 "banned_words": BANNED_WORDS,
                 "settings": SETTINGS,
+                "opt_notify_usernames": OPT_NOTIFY_USERNAMES,
+                "opt_words": OPT_WORDS,
             },
             f, ensure_ascii=False, indent=2,
         )
 
 
-NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS = load_config()
+NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS, OPT_NOTIFY_USERNAMES, OPT_WORDS = load_config()
 
 KEYWORDS = [
     "куплю", "купить", "покупаю", "ищу", "срочно куплю",
@@ -147,11 +168,17 @@ def _build_word_pattern(words):
 
 KEYWORDS_PATTERN = _build_word_pattern(KEYWORDS)
 BANNED_WORDS_PATTERN = _build_word_pattern(BANNED_WORDS)
+OPT_WORDS_PATTERN = _build_word_pattern(OPT_WORDS)
 
 
 def rebuild_banned_pattern():
     global BANNED_WORDS_PATTERN
     BANNED_WORDS_PATTERN = _build_word_pattern(BANNED_WORDS)
+
+
+def rebuild_opt_pattern():
+    global OPT_WORDS_PATTERN
+    OPT_WORDS_PATTERN = _build_word_pattern(OPT_WORDS)
 
 
 # ───── ОБУЧЕНИЕ С ПОДТВЕРЖДЕНИЕМ (/spam, /notspam, /suggestions) ─────
@@ -300,7 +327,13 @@ stats = {
     "filtered_duplicate": 0,
     "filtered_classifier": 0,
     "spam_to_owner": 0,   # похоже на спам — отправлено владельцу на проверку
+    "opt_found": 0,       # опт-лиды — отправлено @BigPar_Opt (и др. из OPT_NOTIFY_USERNAMES)
 }
+
+# антидубль опт-потока: один пользователь не чаще раза в час, независимо
+# от розничного антидубля (DUPLICATE_USER_WINDOW/user_last_seen)
+opt_user_last_seen = {}
+OPT_DUPLICATE_WINDOW = 60 * 60
 
 found_clients = []
 initial_setup_done = False  # вступление в группы + запуск шедулера — только один раз, не при каждом переподключении
@@ -500,6 +533,47 @@ async def join_groups_and_cache_ids():
                 print(f"⏳ Ждём {wait_time} сек (из Exception)...")
                 await asyncio.sleep(wait_time)
 
+# ───── ОПТ-ЛИДЫ ─────
+async def route_opt_lead(event, chat, sender):
+    # Отдельная ниша по запросу @BigPar_Opt: совпадение по OPT_WORDS_PATTERN
+    # (опт/оптом/поставщик/большой объём и т.п.) — независимо от розничных
+    # KEYWORDS/BANNED_WORDS/классификатора. Шлём только в OPT_NOTIFY_USERNAMES.
+    now = time.time()
+    if now - opt_user_last_seen.get(sender.id, 0) < OPT_DUPLICATE_WINDOW:
+        return
+    opt_user_last_seen[sender.id] = now
+
+    if chat.username:
+        message_link = f"https://t.me/{chat.username}/{event.id}"
+    else:
+        chat_id_positive = abs(chat.id) if chat.id < 0 else chat.id
+        message_link = f"https://t.me/c/{chat_id_positive}/{event.id}"
+
+    if sender.username:
+        user_display = f"@{sender.username}"
+    else:
+        user_display = f"Пользователь {sender.id} (без username)"
+
+    stats["opt_found"] += 1
+    print(f"📦 ОПТ-ЛИД: {user_display} / {chat.title}")
+
+    admin_text = (
+        f"📦 ОПТ\n"
+        f"{user_display}\n"
+        f"{event.raw_text}\n"
+        f"{message_link}"
+    )
+    for admin in OPT_NOTIFY_USERNAMES:
+        try:
+            await client.send_message(admin, admin_text)
+            print(f"✅ Опт-лид отправлен: {admin}")
+        except FloodWaitError as e:
+            print(f"⏳ FloodWait для {admin}: {e.seconds} сек")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            print(f"❌ Не удалось отправить опт-лид {admin}: {e}")
+
+
 # ───── ПОХОЖЕ НА СПАМ → ТОЛЬКО ВЛАДЕЛЬЦУ ─────
 async def route_suspected_spam(event, chat, sender, reason):
     # Сообщение похоже на спам (бан-слово или классификатор): остальным
@@ -586,6 +660,12 @@ async def handler(event):
     if len(text) > MAX_MESSAGE_LEN:
         stats["filtered_long"] += 1
         return
+
+    # Опт — отдельный поток, проверяется независимо от розничных KEYWORDS
+    # (сообщение может не содержать "куплю"/"ищу" вовсе, например "нужен
+    # поставщик, объёмы большие") и не фильтруется банвордами/классификатором.
+    if OPT_WORDS_PATTERN.search(text):
+        await route_opt_lead(event, chat, sender)
 
     if not KEYWORDS_PATTERN.search(text):
         return
@@ -717,6 +797,12 @@ HELP_TEXT = (
     "/addadmin <@username> — добавить получателя уведомлений\n"
     "/deladmin <@username> — убрать получателя уведомлений\n"
     "/listadmins — показать получателей уведомлений\n"
+    "/addoptword <слово> — добавить опт-слово (отдельный поток по опту/поставщикам)\n"
+    "/deloptword <слово> — убрать опт-слово\n"
+    "/listoptwords — показать опт-слова\n"
+    "/addoptadmin <@username> — добавить получателя опт-лидов (по умолч. @BigPar_Opt)\n"
+    "/deloptadmin <@username> — убрать получателя опт-лидов\n"
+    "/listoptadmins — показать получателей опт-лидов\n"
     "/help — это сообщение"
 )
 
@@ -937,6 +1023,60 @@ async def command_handler(event):
     elif cmd == "/listadmins":
         await event.reply("Получатели уведомлений:\n" + "\n".join(NOTIFY_USERNAMES))
 
+    elif cmd == "/addoptword":
+        if not arg:
+            await event.reply("Использование: /addoptword <слово или фраза>")
+            return
+        word = arg.lower()
+        if word in OPT_WORDS:
+            await event.reply(f"«{word}» уже в опт-списке")
+            return
+        OPT_WORDS.append(word)
+        rebuild_opt_pattern()
+        save_config()
+        await event.reply(f"✅ Добавлено опт-слово: {word}")
+
+    elif cmd == "/deloptword":
+        word = arg.lower()
+        if word not in OPT_WORDS:
+            await event.reply(f"«{word}» не найдено в опт-списке")
+            return
+        OPT_WORDS.remove(word)
+        rebuild_opt_pattern()
+        save_config()
+        await event.reply(f"✅ Убрано опт-слово: {word}")
+
+    elif cmd == "/listoptwords":
+        await event.reply("Опт-слова:\n" + ", ".join(OPT_WORDS))
+
+    elif cmd == "/addoptadmin":
+        if not arg:
+            await event.reply("Использование: /addoptadmin <@username>")
+            return
+        username = normalize_username(arg)
+        if username.lower() in [u.lower() for u in OPT_NOTIFY_USERNAMES]:
+            await event.reply(f"{username} уже получает опт-лиды")
+            return
+        OPT_NOTIFY_USERNAMES.append(username)
+        save_config()
+        await event.reply(f"✅ Добавлен получатель опт-лидов: {username}")
+
+    elif cmd == "/deloptadmin":
+        if not arg:
+            await event.reply("Использование: /deloptadmin <@username>")
+            return
+        username = normalize_username(arg)
+        match = next((u for u in OPT_NOTIFY_USERNAMES if u.lower() == username.lower()), None)
+        if not match:
+            await event.reply(f"{username} не найден в списке получателей опт-лидов")
+            return
+        OPT_NOTIFY_USERNAMES.remove(match)
+        save_config()
+        await event.reply(f"✅ Убран получатель опт-лидов: {match}")
+
+    elif cmd == "/listoptadmins":
+        await event.reply("Получатели опт-лидов:\n" + "\n".join(OPT_NOTIFY_USERNAMES))
+
 # ───── ДНЕВНОЙ ОТЧЁТ ─────
 async def send_daily_report():
 
@@ -960,6 +1100,7 @@ async def send_daily_report():
 🚫 Дубликаты: {stats['filtered_duplicate']}
 🚫 Классификатор: {stats['filtered_classifier']}
 ⚠️ Похоже на спам (вам на проверку): {stats['spam_to_owner']}
+📦 Опт-лидов: {stats['opt_found']}
 """
 
     if found_clients:
