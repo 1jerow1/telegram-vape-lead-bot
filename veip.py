@@ -12,6 +12,8 @@ from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.errors import FloodWaitError
 
+import spam_model
+
 # ───── НАСТРОЙКИ ─────
 # DATA_DIR — где лежат/создаются все изменяемые файлы (сессия, конфиг,
 # группы, кеш, фидбек). По умолчанию — папка проекта (локальный запуск,
@@ -204,7 +206,7 @@ FEEDBACK_STOPWORDS = {
 
 def _lead_words():
     words = set()
-    for t in FEEDBACK["lead_texts"]:
+    for t in FEEDBACK["lead_texts"] + ML_BASE["lead"]:
         words.update(re.findall(r"[а-яёa-z0-9]+", t))
     return words
 
@@ -246,55 +248,37 @@ def auto_ban_from_spam(text):
     return added
 
 
-# ───── КЛАССИФИКАТОР (наивный байес поверх feedback.json) ─────
-# Дополнительный слой поверх банвордов: ищет закономерности по всему
-# накопленному тексту, а не только по отдельным словам из /spam. Пока
-# примеров мало — молчит (см. CLASSIFIER_MIN_EXAMPLES), чтобы не резать
-# лиды на шумных данных. Ничего не банит "навсегда" — просто решает,
-# пересылать ли конкретное сообщение, работает при каждой проверке заново.
+# ───── КЛАССИФИКАТОР (наивный байес, см. spam_model.py) ─────
+# Дополнительный слой поверх банвордов. Обучается на базовом датасете
+# ml_train.json (размеченная история бота, лежит только в DATA_DIR — не в
+# git) + явных пометках владельца /spam и /notspam из feedback.json (с
+# повышенным весом). Сам на своих решениях НЕ дообучается. Ничего не банит
+# "навсегда" — решает только, пересылать ли конкретное сообщение; похожее
+# на спам уходит владельцу на проверку, а не теряется.
 ENABLE_ML_CLASSIFIER = True
 CLASSIFIER_MIN_EXAMPLES = 15   # меньше — данных мало, классификатор не включаем
-CLASSIFIER_MARGIN = 3.0        # насколько увереннее "спам", чтобы заблокировать
+CLASSIFIER_MARGIN = 4.0        # лог-отношение «спам/лид», выше которого считаем спамом
+FEEDBACK_WEIGHT = 5.0          # во сколько раз пометка владельца весомее базового примера
+ML_TRAIN_PATH = _data_path("ml_train.json")
+ML_BASE = spam_model.load_base_dataset(ML_TRAIN_PATH)
+ML_MODEL = None  # строится после загрузки FEEDBACK, см. rebuild_ml_model()
 
 
-def _word_counts(texts):
-    counts = {}
-    total = 0
-    for t in texts:
-        for w in re.findall(r"[а-яёa-z0-9]+", t):
-            counts[w] = counts.get(w, 0) + 1
-            total += 1
-    return counts, total
+def rebuild_ml_model():
+    global ML_MODEL
+    ML_MODEL = spam_model.build_model(ML_BASE, FEEDBACK, FEEDBACK_WEIGHT)
+    ML_MODEL.score("")  # прогреваем кеш весов сразу, а не на первом сообщении
 
 
 def classify_spam(text):
     """
-    Наивный байесовский классификатор на словах из FEEDBACK["spam_texts"]/
-    ["lead_texts"]. Возвращает (is_spam, margin). is_spam=True — только
-    если данных достаточно и модель уверена (margin > CLASSIFIER_MARGIN).
-    margin — насколько лог-правдоподобие "спам" больше, чем "лид"
-    (для логов/отладки).
+    Возвращает (is_spam, margin). is_spam=True — только если данных
+    достаточно и margin > CLASSIFIER_MARGIN. margin — насколько вероятность
+    «спам» больше, чем «лид» (лог-отношение, для логов/отладки).
     """
-    spam_texts = FEEDBACK["spam_texts"]
-    lead_texts = FEEDBACK["lead_texts"]
-    if len(spam_texts) < CLASSIFIER_MIN_EXAMPLES or len(lead_texts) < CLASSIFIER_MIN_EXAMPLES:
+    if ML_MODEL is None or not ML_MODEL.ready(CLASSIFIER_MIN_EXAMPLES):
         return False, 0.0
-
-    spam_counts, spam_total = _word_counts(spam_texts)
-    lead_counts, lead_total = _word_counts(lead_texts)
-    vocab_size = len(set(spam_counts) | set(lead_counts)) or 1
-
-    n_spam, n_lead = len(spam_texts), len(lead_texts)
-    log_spam = math.log(n_spam / (n_spam + n_lead))
-    log_lead = math.log(n_lead / (n_spam + n_lead))
-
-    for w in re.findall(r"[а-яёa-z0-9]+", text):
-        # сглаживание Лапласа — чтобы слово, которого модель не видела,
-        # не обнуляло вероятность целиком
-        log_spam += math.log((spam_counts.get(w, 0) + 1) / (spam_total + vocab_size))
-        log_lead += math.log((lead_counts.get(w, 0) + 1) / (lead_total + vocab_size))
-
-    margin = log_spam - log_lead
+    margin = ML_MODEL.score(text)
     return margin > CLASSIFIER_MARGIN, margin
 
 
@@ -397,7 +381,7 @@ def save_joined_groups():
 
 
 FEEDBACK_PATH = _data_path("feedback.json")
-FEEDBACK_CAP = 300  # сколько последних примеров каждого типа хранить
+FEEDBACK_CAP = 2000  # сколько последних пометок владельца каждого типа хранить
 
 
 def load_feedback():
@@ -419,21 +403,34 @@ def save_feedback():
         json.dump(FEEDBACK, f, ensure_ascii=False, indent=2)
 
 
-# Размеченные примеры сообщений — каждый найденный лид сразу попадает сюда
-# как "notspam" (по умолчанию считаем находку реальным лидом); командой
-# /spam владелец переносит конкретное сообщение в спам. На основе этого
-# /suggestions предлагает новые бан-слова.
+# Размеченные владельцем примеры: сюда попадают ТОЛЬКО сообщения, на
+# которые владелец ответил /spam или /notspam. (Раньше сюда автоматически
+# писалось каждое найденное и каждое заблокированное сообщение, и
+# классификатор учился на собственных ошибках.) На основе этого
+# /suggestions предлагает новые бан-слова, и обучается классификатор.
 FEEDBACK = load_feedback()
+rebuild_ml_model()
+print(
+    f"🧠 Классификатор: база {len(ML_BASE['spam'])} спам / {len(ML_BASE['lead'])} лидов, "
+    f"пометок владельца {len(FEEDBACK['spam_texts'])} / {len(FEEDBACK['lead_texts'])}"
+)
 
 
 def mark_feedback(text, is_spam):
     target = FEEDBACK["spam_texts"] if is_spam else FEEDBACK["lead_texts"]
     other = FEEDBACK["lead_texts"] if is_spam else FEEDBACK["spam_texts"]
+    other_label = "lead" if is_spam else "spam"
+    target_label = "spam" if is_spam else "lead"
+    # модель обновляем точечно (полная пересборка — несколько секунд)
     if text in other:
         other.remove(text)
+        ML_MODEL.remove(text, other_label, FEEDBACK_WEIGHT)
     if text not in target:
         target.append(text)
-    del target[:-FEEDBACK_CAP]  # оставляем только последние FEEDBACK_CAP
+        ML_MODEL.add(text, target_label, FEEDBACK_WEIGHT)
+    for old in target[:-FEEDBACK_CAP]:  # оставляем только последние FEEDBACK_CAP
+        ML_MODEL.remove(old, target_label, FEEDBACK_WEIGHT)
+    del target[:-FEEDBACK_CAP]
     save_feedback()
 
 
@@ -609,8 +606,8 @@ async def route_suspected_spam(event, chat, sender, reason):
     else:
         user_display = f"Пользователь {sender.id} (без username)"
 
-    # текущая ставка бота — спам; /notspam переносит обратно в лиды
-    mark_feedback((event.raw_text or "").lower(), is_spam=True)
+    # в feedback НЕ пишем — это лишь догадка бота; учимся только на
+    # ответе владельца (/spam или /notspam)
 
     owner_text = (
         f"⚠️ ПОХОЖЕ НА СПАМ ({reason})\n"
@@ -739,9 +736,8 @@ async def handler(event):
 
     stats["found"] += 1
 
-    # по умолчанию считаем находку реальным лидом — /spam переносит
-    # конкретное сообщение в спам, если это ошибка
-    mark_feedback(text, is_spam=False)
+    # в feedback НЕ пишем автоматически — если это ошибка, владелец
+    # ответит /spam, и только тогда сообщение попадёт в обучение
 
     print("\n🔥 НАЙДЕН КЛИЕНТ")
     print("Группа:", chat.title)
@@ -803,6 +799,7 @@ HELP_TEXT = (
     "/notspam — ответом на «похоже на спам»: это реальный лид, разошлю остальным (или отмена /spam)\n"
     "/suggestions — слова, частые в отмеченном спаме, но не забаненные автоматически\n"
     "/mlstatus — состояние классификатора (сколько примеров, активен ли)\n"
+    "/mltest <текст> — как классификатор оценит такое сообщение\n"
     "/banwords [on|off] — фильтр по бан-словам: похожее на спам идёт только вам (по умолч. on)\n"
     "/mlfilter [on|off] — то же для классификатора\n"
     "/addgroup <@группа или ссылка> — добавить и вступить в группу\n"
@@ -943,9 +940,7 @@ async def command_handler(event):
         )
 
     elif cmd == "/mlstatus":
-        n_spam = len(FEEDBACK["spam_texts"])
-        n_lead = len(FEEDBACK["lead_texts"])
-        enough = n_spam >= CLASSIFIER_MIN_EXAMPLES and n_lead >= CLASSIFIER_MIN_EXAMPLES
+        enough = ML_MODEL is not None and ML_MODEL.ready(CLASSIFIER_MIN_EXAMPLES)
         if not SETTINGS["ml_filter"]:
             state = "выключен командой /mlfilter off"
         elif ENABLE_ML_CLASSIFIER and enough:
@@ -954,9 +949,23 @@ async def command_handler(event):
             state = "выключен (мало данных)"
         await event.reply(
             f"Классификатор: {state}\n"
-            f"Примеров спама: {n_spam}/{CLASSIFIER_MIN_EXAMPLES}\n"
-            f"Примеров лидов: {n_lead}/{CLASSIFIER_MIN_EXAMPLES}\n"
-            f"Порог уверенности: {CLASSIFIER_MARGIN}"
+            f"Базовый датасет: {len(ML_BASE['spam'])} спам / {len(ML_BASE['lead'])} лидов\n"
+            f"Ваши пометки: {len(FEEDBACK['spam_texts'])} /spam, {len(FEEDBACK['lead_texts'])} /notspam "
+            f"(вес ×{FEEDBACK_WEIGHT:g})\n"
+            f"Порог уверенности: {CLASSIFIER_MARGIN}\n"
+            f"Проверить текст: /mltest <текст>"
+        )
+
+    elif cmd == "/mltest":
+        if not arg:
+            await event.reply("Использование: /mltest <текст сообщения>")
+            return
+        is_spam_ml, margin = classify_spam(arg)
+        top = ML_MODEL.top_features(arg) if ML_MODEL is not None else []
+        why = "\n".join(f"  {f}: {w:+.1f}" for f, w in top) or "  —"
+        await event.reply(
+            f"{'🚫 спам' if is_spam_ml else '✅ лид'} (уверенность {margin:.1f}, порог {CLASSIFIER_MARGIN})\n"
+            f"Главные признаки (+ спам, − лид):\n{why}"
         )
 
     elif cmd in ("/banwords", "/mlfilter"):

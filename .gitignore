@@ -17,3 +17,9 @@ __pycache__/
 
 # scratch/IDE
 tempCodeRunnerFile.py
+
+# база для классификатора (тексты реальных сообщений) — только на volume
+ml_train.json
+# экспорт переписки из Telegram — приватные данные
+ChatExport_*/
+session.session.dead*
