@@ -48,7 +48,7 @@ def normalize(text):
     return re.sub(r"\s+", " ", s).strip()
 
 
-def features(text):
+def features(text, token_map=None):
     raw = text or ""
     s = normalize(raw)
     s = _NUM_SPLIT.sub("", s)
@@ -60,6 +60,8 @@ def features(text):
             toks.append("#n" if n < 100 else "#nn" if n < 1000 else "#nnn")
         elif len(t) >= 2:
             toks.append(t[:12])   # грубый стемминг: обрезаем длинные окончания
+    if token_map:
+        toks = [token_map(t) for t in toks]
     feats = set(toks)
     feats.update(a + "_" + b for a, b in zip(toks, toks[1:]))
     if "@" in raw:
@@ -79,6 +81,34 @@ def features(text):
     return feats
 
 
+# Названия товаров заменяются на общий токен: о намерении они ничего не
+# говорят, а в обучающих данных встречаются почти только у покупателей, и без
+# этого «продаю оптом хросы 5 мини» выглядело бы как покупка.
+_OPT_PRODUCT = re.compile(
+    r"(жиж|жидк|карик|картридж|катридж|кт$|под$|поды$|подов$|подик|одноразк|однаразк|расходник|"
+    r"испар|хрос|xros|хирик|хиро|мини$|mini$|elf|эльф|монашк|пасик|пасито|ватр|вейп|снюс|vozol|"
+    r"hqd|катс|кэтс|банк$|банок$|банки$|банку$|тушк|устройств)"
+)
+
+
+def _opt_token(t):
+    return "#товар" if _OPT_PRODUCT.match(t) else t
+
+
+def opt_features(text):
+    """Признаки опт-классификатора: товары обобщены (см. _OPT_PRODUCT), плюс
+    знак вопроса и первое слово. Покупатель и продавец пишут одними словами,
+    разница в форме: «есть опт?» и «есть опт», «ищу опт...» и «опт от 10 шт»."""
+    feats = features(text, _opt_token)
+    feats.discard("#товар")   # сам факт упоминания товара намерения не выдаёт
+    if "?" in (text or ""):
+        feats.add("#question")
+    first = _TOKEN.search(_NUM_SPLIT.sub("", normalize(text)))
+    if first:
+        feats.add("^" + _opt_token(first.group(0)[:12]))
+    return feats
+
+
 class SpamModel:
     """Наивный Байес (мультиномиальный на бинарных признаках) с равными
     априорными вероятностями классов.
@@ -88,8 +118,9 @@ class SpamModel:
     видела, не влияют. Порог выбирается в veip.py (CLASSIFIER_MARGIN).
     """
 
-    def __init__(self, alpha=0.5):
+    def __init__(self, alpha=0.5, featurizer=features):
         self.alpha = alpha
+        self.featurizer = featurizer
         self.df = {"spam": {}, "lead": {}}
         self.n = {"spam": 0.0, "lead": 0.0}      # сколько сообщений (с весами)
         self.tot = {"spam": 0.0, "lead": 0.0}    # сколько признаков (с весами)
@@ -97,7 +128,7 @@ class SpamModel:
 
     def add(self, text, label, weight=1.0):
         d = self.df[label]
-        fs = features(text)
+        fs = self.featurizer(text)
         for f in fs:
             d[f] = d.get(f, 0.0) + weight
         self.n[label] += weight
@@ -106,7 +137,7 @@ class SpamModel:
 
     def remove(self, text, label, weight=1.0):
         d = self.df[label]
-        fs = features(text)
+        fs = self.featurizer(text)
         for f in fs:
             left = d.get(f, 0.0) - weight
             if left > 1e-9:
@@ -136,12 +167,12 @@ class SpamModel:
         if self._cache is None:
             self._prepare()
         w = self._cache
-        return sum(w.get(f, 0.0) for f in features(text))
+        return sum(w.get(f, 0.0) for f in self.featurizer(text))
 
     def top_features(self, text, k=5):
         if self._cache is None:
             self._prepare()
-        fs = [(f, self._cache[f]) for f in features(text) if f in self._cache]
+        fs = [(f, self._cache[f]) for f in self.featurizer(text) if f in self._cache]
         return sorted(fs, key=lambda x: -abs(x[1]))[:k]
 
 
@@ -151,6 +182,26 @@ def load_base_dataset(path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return {"spam": data.get("spam", []), "lead": data.get("lead", [])}
+
+
+OPT_SEED_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "opt_seed.json")
+
+
+def build_opt_model(seed, base, feedback, feedback_weight=5.0):
+    """Опт-классификатор: «lead» — ищет оптовика/поставщика, «spam» — продаёт
+    оптом, не по теме или просто обсуждает. Источники: затравка opt_seed.json
+    (в git), реальные сообщения opt_train.json и пометки владельца."""
+    m = SpamModel(featurizer=opt_features)
+    for source in (seed, base):
+        for t in source["spam"]:
+            m.add(t, "spam")
+        for t in source["lead"]:
+            m.add(t, "lead")
+    for t in feedback.get("spam_texts", []):
+        m.add(t, "spam", feedback_weight)
+    for t in feedback.get("lead_texts", []):
+        m.add(t, "lead", feedback_weight)
+    return m
 
 
 def build_model(base, feedback, feedback_weight=5.0):

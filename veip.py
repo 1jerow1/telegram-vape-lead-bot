@@ -100,6 +100,7 @@ DEFAULT_BANNED_WORDS = [
 DEFAULT_SETTINGS = {
     "banwords_filter": True,   # реагировать на бан-слова
     "ml_filter": True,         # реагировать на классификатор
+    "opt_ml_filter": True,     # опт-классификатор: похожее на продавца — только владельцу
 }
 
 # ───── ОПТ-ПОТОК (отдельно от розничных лидов) ─────
@@ -111,9 +112,19 @@ DEFAULT_OPT_NOTIFY_USERNAMES = ["@BigPar_Opt"]
 
 DEFAULT_OPT_WORDS = [
     "опт", "оптом", "опту", "оптовый", "оптовая", "оптовое", "оптовые",
-    "оптовых", "оптовому", "оптовой",
+    "оптовых", "оптовому", "оптовой", "опта", "оптового",
+    "оптовик", "оптовика", "оптовику", "оптовиков", "оптовики", "оптовиком",
     "большой объем", "большой объём",
-    "поставщик", "поставщика", "поставщику", "поставщиков", "поставщиком",
+    "поставщик", "поставщика", "поставщику", "поставщиков", "поставщиком", "поставщики",
+]
+
+# Слова, добавленные после появления опт-потока. В уже сохранённом config.json
+# лежит старый список, поэтому один раз дописываем их туда; rev в настройках
+# нужен, чтобы слово, убранное через /deloptword, не возвращалось при рестарте.
+OPT_WORDS_REV = 1
+OPT_WORDS_ADDED = [
+    "опта", "оптового", "оптовик", "оптовика", "оптовику", "оптовиков",
+    "оптовики", "оптовиком", "поставщики",
 ]
 
 # Если в сообщении есть одно из этих слов — в опт не шлём, даже если
@@ -161,6 +172,11 @@ def save_config():
 
 
 NOTIFY_USERNAMES, BANNED_WORDS, SETTINGS, OPT_NOTIFY_USERNAMES, OPT_WORDS, OPT_EXCLUDE_WORDS = load_config()
+
+if SETTINGS.get("opt_words_rev", 0) < OPT_WORDS_REV:
+    OPT_WORDS.extend(w for w in OPT_WORDS_ADDED if w not in OPT_WORDS)
+    SETTINGS["opt_words_rev"] = OPT_WORDS_REV
+    save_config()
 
 KEYWORDS = [
     "куплю", "купить", "покупаю", "ищу", "срочно куплю",
@@ -325,6 +341,7 @@ stats = {
     "filtered_classifier": 0,
     "spam_to_owner": 0,   # похоже на спам — отправлено владельцу на проверку
     "opt_found": 0,       # опт-лиды — отправлено @BigPar_Opt (и др. из OPT_NOTIFY_USERNAMES)
+    "opt_to_owner": 0,    # опт: похоже на продавца — отправлено владельцу на проверку
 }
 
 # антидубль опт-потока: один пользователь не чаще раза в час, независимо
@@ -384,23 +401,18 @@ FEEDBACK_PATH = _data_path("feedback.json")
 FEEDBACK_CAP = 2000  # сколько последних пометок владельца каждого типа хранить
 
 
-def load_feedback():
-    if os.path.exists(FEEDBACK_PATH):
+def load_feedback(path=FEEDBACK_PATH):
+    if os.path.exists(path):
         try:
-            with open(FEEDBACK_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return {
                 "spam_texts": data.get("spam_texts", []),
                 "lead_texts": data.get("lead_texts", []),
             }
         except Exception as e:
-            print(f"[!] Не удалось прочитать {FEEDBACK_PATH}: {e}")
+            print(f"[!] Не удалось прочитать {path}: {e}")
     return {"spam_texts": [], "lead_texts": []}
-
-
-def save_feedback():
-    with open(FEEDBACK_PATH, "w", encoding="utf-8") as f:
-        json.dump(FEEDBACK, f, ensure_ascii=False, indent=2)
 
 
 # Размеченные владельцем примеры: сюда попадают ТОЛЬКО сообщения, на
@@ -416,22 +428,59 @@ print(
 )
 
 
-def mark_feedback(text, is_spam):
-    target = FEEDBACK["spam_texts"] if is_spam else FEEDBACK["lead_texts"]
-    other = FEEDBACK["lead_texts"] if is_spam else FEEDBACK["spam_texts"]
+def _apply_mark(model, feedback, path, text, is_spam):
+    target = feedback["spam_texts"] if is_spam else feedback["lead_texts"]
+    other = feedback["lead_texts"] if is_spam else feedback["spam_texts"]
     other_label = "lead" if is_spam else "spam"
     target_label = "spam" if is_spam else "lead"
     # модель обновляем точечно (полная пересборка — несколько секунд)
     if text in other:
         other.remove(text)
-        ML_MODEL.remove(text, other_label, FEEDBACK_WEIGHT)
+        model.remove(text, other_label, FEEDBACK_WEIGHT)
     if text not in target:
         target.append(text)
-        ML_MODEL.add(text, target_label, FEEDBACK_WEIGHT)
+        model.add(text, target_label, FEEDBACK_WEIGHT)
     for old in target[:-FEEDBACK_CAP]:  # оставляем только последние FEEDBACK_CAP
-        ML_MODEL.remove(old, target_label, FEEDBACK_WEIGHT)
+        model.remove(old, target_label, FEEDBACK_WEIGHT)
     del target[:-FEEDBACK_CAP]
-    save_feedback()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(feedback, f, ensure_ascii=False, indent=2)
+
+
+def mark_feedback(text, is_spam):
+    _apply_mark(ML_MODEL, FEEDBACK, FEEDBACK_PATH, text, is_spam)
+
+
+# ───── ОПТ-КЛАССИФИКАТОР (spam_model.build_opt_model) ─────
+# Отделяет тех, кто ищет оптовика/поставщика, от тех, кто продаёт оптом.
+# Отдельная модель со своими пометками: розничный «спам» и опт-«продавец» —
+# разные вещи. Обучается на opt_seed.json (в git), opt_train.json (реальные
+# сообщения, только в DATA_DIR) и ответах владельца. Если данных нет,
+# фильтр не срабатывает и опт-поток работает как раньше.
+OPT_CLASSIFIER_MARGIN = 0.0    # выше — «не ищет опт». Подобран на кросс-валидации, см. README
+OPT_FEEDBACK_PATH = _data_path("opt_feedback.json")
+OPT_SEED = spam_model.load_base_dataset(spam_model.OPT_SEED_PATH)
+OPT_BASE = spam_model.load_base_dataset(_data_path("opt_train.json"))
+OPT_FEEDBACK = load_feedback(OPT_FEEDBACK_PATH)
+OPT_MODEL = spam_model.build_opt_model(OPT_SEED, OPT_BASE, OPT_FEEDBACK, FEEDBACK_WEIGHT)
+OPT_MODEL.score("")  # прогреваем кеш весов сразу, а не на первом сообщении
+print(
+    f"📦 Опт-классификатор: затравка {len(OPT_SEED['lead'])} / {len(OPT_SEED['spam'])}, "
+    f"реальные {len(OPT_BASE['lead'])} / {len(OPT_BASE['spam'])}, "
+    f"пометок владельца {len(OPT_FEEDBACK['lead_texts'])} / {len(OPT_FEEDBACK['spam_texts'])} (покупатели / нет)"
+)
+
+
+def classify_opt(text):
+    """Возвращает (ищет_опт, margin). margin > OPT_CLASSIFIER_MARGIN — не ищет."""
+    if not SETTINGS["opt_ml_filter"] or not OPT_MODEL.ready(CLASSIFIER_MIN_EXAMPLES):
+        return True, 0.0
+    margin = OPT_MODEL.score(text)
+    return margin <= OPT_CLASSIFIER_MARGIN, margin
+
+
+def mark_opt_feedback(text, is_spam):
+    _apply_mark(OPT_MODEL, OPT_FEEDBACK, OPT_FEEDBACK_PATH, text, is_spam)
 
 
 # Группы, в которые уже успешно вступили — chat_id каждой закеширован тут,
@@ -492,6 +541,11 @@ SUSPECTED_SPAM_CAP = 500
 suspected_spam_last_seen = {}
 SUSPECTED_SPAM_WINDOW = 60 * 60
 
+# message_id (в чате с владельцем) → данные опт-сообщения. Сюда попадает каждое
+# сообщение опт-потока: ответ /spam или /notspam дообучает опт-классификатор.
+opt_review_msgs = {}
+OPT_REVIEW_CAP = 2000
+
 # ───── ВСТУПАЕМ В ГРУППЫ ─────
 async def join_single_group(identifier, skip_if_joined=False):
     entity = await client.get_entity(identifier)
@@ -544,10 +598,31 @@ async def join_groups_and_cache_ids():
                 await asyncio.sleep(wait_time)
 
 # ───── ОПТ-ЛИДЫ ─────
+async def deliver_opt_lead(info):
+    # Владельцу не шлём: он уже получил это сообщение на проверку
+    admin_text = f"📦 ОПТ\n{info['user_display']}\n{info['raw']}\n{info['link']}"
+    delivered = []
+    for admin in OPT_NOTIFY_USERNAMES:
+        if admin.lower() == OWNER_ID.lower():
+            continue
+        try:
+            await client.send_message(admin, admin_text)
+            delivered.append(admin)
+            print(f"✅ Опт-лид отправлен: {admin}")
+        except FloodWaitError as e:
+            print(f"⏳ FloodWait для {admin}: {e.seconds} сек")
+            await asyncio.sleep(e.seconds)
+        except Exception as e:
+            print(f"❌ Не удалось отправить опт-лид {admin}: {e}")
+    return delivered
+
+
 async def route_opt_lead(event, chat, sender):
     # Отдельная ниша по запросу @BigPar_Opt: совпадение по OPT_WORDS_PATTERN
     # (опт/оптом/поставщик/большой объём и т.п.) — независимо от розничных
-    # KEYWORDS/BANNED_WORDS/классификатора. Шлём только в OPT_NOTIFY_USERNAMES.
+    # KEYWORDS/BANNED_WORDS/классификатора. Покупателей шлём в
+    # OPT_NOTIFY_USERNAMES; похожих на продавца — только владельцу на проверку.
+    # Владелец видит оба случая, иначе ошибки модели нечем было бы исправлять.
     now = time.time()
     if now - opt_user_last_seen.get(sender.id, 0) < OPT_DUPLICATE_WINDOW:
         return
@@ -564,24 +639,58 @@ async def route_opt_lead(event, chat, sender):
     else:
         user_display = f"Пользователь {sender.id} (без username)"
 
-    stats["opt_found"] += 1
-    print(f"📦 ОПТ-ЛИД: {user_display} / {chat.title}")
+    raw = event.raw_text or ""
+    is_lead, margin = classify_opt(raw)
+    info = {"raw": raw, "link": message_link, "user_display": user_display, "delivered": is_lead}
 
-    admin_text = (
-        f"📦 ОПТ\n"
-        f"{user_display}\n"
-        f"{event.raw_text}\n"
-        f"{message_link}"
-    )
-    for admin in OPT_NOTIFY_USERNAMES:
-        try:
-            await client.send_message(admin, admin_text)
-            print(f"✅ Опт-лид отправлен: {admin}")
-        except FloodWaitError as e:
-            print(f"⏳ FloodWait для {admin}: {e.seconds} сек")
-            await asyncio.sleep(e.seconds)
-        except Exception as e:
-            print(f"❌ Не удалось отправить опт-лид {admin}: {e}")
+    if is_lead:
+        stats["opt_found"] += 1
+        print(f"📦 ОПТ-ЛИД: {user_display} / {chat.title}")
+        await deliver_opt_lead(info)
+        owner_text = (
+            f"📦 ОПТ: покупатель (уверенность {margin:.1f}), ушло получателям\n"
+            f"{user_display}\n{raw}\n{message_link}\n\n"
+            f"Ответьте /spam, если это продавец или не по теме (модель учтёт)"
+        )
+    else:
+        stats["opt_to_owner"] += 1
+        print(f"📦 Опт: похоже на продавца ({margin:.1f}) — только владельцу на проверку")
+        owner_text = (
+            f"⚠️ ОПТ: похоже на продавца (уверенность {margin:.1f}), получателям НЕ ушло\n"
+            f"{user_display}\n{raw}\n{message_link}\n\n"
+            f"Ответьте /notspam — это покупатель (разошлю получателям опта)\n"
+            f"или /spam — подтвердить"
+        )
+
+    try:
+        sent = await client.send_message(OWNER_ID, owner_text)
+        opt_review_msgs[sent.id] = info
+        if len(opt_review_msgs) > OPT_REVIEW_CAP:
+            opt_review_msgs.clear()
+    except FloodWaitError as e:
+        print(f"⏳ FloodWait при отправке владельцу: {e.seconds} сек")
+        await asyncio.sleep(e.seconds)
+    except Exception as e:
+        print(f"❌ Не удалось отправить владельцу: {e}")
+
+
+async def handle_opt_review(event, cmd, info):
+    # /spam и /notspam в ответ на опт-сообщение: учится только опт-модель,
+    # розничные пометки и бан-слова не затрагиваются
+    mark_opt_feedback(info["raw"].lower(), is_spam=(cmd == "/spam"))
+    if cmd == "/spam":
+        note = " Сообщение уже ушло получателям, отозвать его нельзя." if info["delivered"] else ""
+        await event.reply(f"✅ Опт: записано как «не покупатель».{note}")
+        return
+    if info["delivered"]:
+        await event.reply("✅ Опт: записано как покупатель")
+        return
+    info["delivered"] = True
+    delivered = await deliver_opt_lead(info)
+    if delivered:
+        await event.reply("✅ Опт: покупатель, разослано: " + ", ".join(delivered))
+    else:
+        await event.reply("✅ Опт: записано как покупатель (других получателей нет)")
 
 
 # ───── ПОХОЖЕ НА СПАМ → ТОЛЬКО ВЛАДЕЛЬЦУ ─────
@@ -673,7 +782,8 @@ async def handler(event):
 
     # Опт — отдельный поток, проверяется независимо от розничных KEYWORDS
     # (сообщение может не содержать "куплю"/"ищу" вовсе, например "нужен
-    # поставщик, объёмы большие") и не фильтруется банвордами/классификатором.
+    # поставщик, объёмы большие") и не фильтруется розничными банвордами и
+    # классификатором; покупателя от продавца отличает опт-классификатор.
     # OPT_EXCLUDE_PATTERN ("продам" и т.п.) — если есть, это не лид для опта.
     if OPT_WORDS_PATTERN.search(text) and not OPT_EXCLUDE_PATTERN.search(text):
         await route_opt_lead(event, chat, sender)
@@ -817,6 +927,9 @@ HELP_TEXT = (
     "/addoptexclude <слово> — если слово есть в сообщении, в опт НЕ слать (по умолч. «продам»)\n"
     "/deloptexclude <слово> — убрать слово-исключение из опта\n"
     "/listoptexcludes — показать слова-исключения опта\n"
+    "/optfilter [on|off] — опт-классификатор: похожее на продавца идёт только вам (по умолч. on)\n"
+    "/opttest <текст> — как опт-классификатор оценит такое сообщение\n"
+    "/spam и /notspam ответом на опт-сообщение учат только опт-классификатор\n"
     "/help — это сообщение"
 )
 
@@ -870,6 +983,12 @@ async def command_handler(event):
     elif cmd in ("/spam", "/notspam"):
         if not event.is_reply:
             await event.reply("Ответьте этой командой на пересланное сообщение с лидом")
+            return
+
+        # опт-поток размечается отдельно от розничного
+        opt_info = opt_review_msgs.get(event.reply_to_msg_id)
+        if opt_info is not None:
+            await handle_opt_review(event, cmd, opt_info)
             return
 
         # 1) ответ на сообщение «похоже на спам» (ушло только владельцу)
@@ -983,6 +1102,41 @@ async def command_handler(event):
         else:
             st = "включён" if SETTINGS[key] else "выключен"
             await event.reply(f"{label}: {st}\nПереключить: {cmd} on | {cmd} off")
+
+    elif cmd == "/optfilter":
+        a = arg.lower()
+        if a in ("on", "вкл", "1", "true"):
+            SETTINGS["opt_ml_filter"] = True
+            save_config()
+            await event.reply("✅ Опт-классификатор: включён — похожее на продавца идёт только вам")
+        elif a in ("off", "выкл", "0", "false"):
+            SETTINGS["opt_ml_filter"] = False
+            save_config()
+            await event.reply("✅ Опт-классификатор: выключен — всё с опт-словами идёт получателям опта")
+        else:
+            st = "включён" if SETTINGS["opt_ml_filter"] else "выключен"
+            await event.reply(
+                f"Опт-классификатор: {st}\n"
+                f"Затравка: {len(OPT_SEED['lead'])} покупателей / {len(OPT_SEED['spam'])} остальных\n"
+                f"Реальные сообщения: {len(OPT_BASE['lead'])} / {len(OPT_BASE['spam'])}\n"
+                f"Ваши пометки: {len(OPT_FEEDBACK['lead_texts'])} /notspam, {len(OPT_FEEDBACK['spam_texts'])} /spam "
+                f"(вес ×{FEEDBACK_WEIGHT:g})\n"
+                f"Порог: {OPT_CLASSIFIER_MARGIN}\n"
+                f"Переключить: /optfilter on | /optfilter off"
+            )
+
+    elif cmd == "/opttest":
+        if not arg:
+            await event.reply("Использование: /opttest <текст сообщения>")
+            return
+        margin = OPT_MODEL.score(arg)
+        top = OPT_MODEL.top_features(arg)
+        why = "\n".join(f"  {f}: {w:+.1f}" for f, w in top) or "  —"
+        verdict = "✅ покупатель" if margin <= OPT_CLASSIFIER_MARGIN else "🚫 не покупатель"
+        await event.reply(
+            f"{verdict} (уверенность {margin:.1f}, порог {OPT_CLASSIFIER_MARGIN})\n"
+            f"Главные признаки (+ продавец, − покупатель):\n{why}"
+        )
 
     elif cmd == "/addgroup":
         if not arg:
@@ -1153,6 +1307,7 @@ async def send_daily_report():
 🚫 Классификатор: {stats['filtered_classifier']}
 ⚠️ Похоже на спам (вам на проверку): {stats['spam_to_owner']}
 📦 Опт-лидов: {stats['opt_found']}
+⚠️ Опт, похоже на продавца (вам на проверку): {stats['opt_to_owner']}
 """
 
     if found_clients:

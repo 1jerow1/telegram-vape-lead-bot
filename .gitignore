@@ -20,6 +20,9 @@ tempCodeRunnerFile.py
 
 # база для классификатора (тексты реальных сообщений) — только на volume
 ml_train.json
+# то же для опт-классификатора: реальные сообщения и пометки владельца
+opt_train.json
+opt_feedback.json
 # экспорт переписки из Telegram — приватные данные
 ChatExport_*/
 session.session.dead*
